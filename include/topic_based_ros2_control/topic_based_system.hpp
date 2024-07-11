@@ -71,6 +71,8 @@ private:
   rclcpp::Node::SharedPtr node_;
   sensor_msgs::msg::JointState latest_joint_state_;
   bool sum_wrapped_joint_states_{ false };
+  bool initial_states_as_initial_cmd_{ false };
+  bool ready_to_send_cmds_{ false };
 
   /// Use standard interfaces for joints because they are relevant for dynamic behavior
   std::array<std::string, 4> standard_interfaces_ = { hardware_interface::HW_IF_POSITION,
@@ -93,6 +95,10 @@ private:
   // If the difference between the current joint state and joint command is less than this value,
   // the joint command will not be published.
   double trigger_joint_command_threshold_ = 1e-5;
+  // If the difference between the current joint state and joint command is more than this value,
+  // the joint command will not be published.
+  double block_joint_command_threshold_ = 5;
+
 
   template <typename HandleType>
   bool getInterface(const std::string& name, const std::string& interface_name, const size_t vector_index,

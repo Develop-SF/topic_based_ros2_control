@@ -96,6 +96,7 @@ CallbackReturn TopicBasedSystem::on_init(const hardware_interface::HardwareInfo&
       }
     }
   }
+  ready_to_send_cmds_ = true;
 
   // Search for mimic joints
   for (auto i = 0u; i < info_.joints.size(); ++i)
@@ -155,6 +156,11 @@ CallbackReturn TopicBasedSystem::on_init(const hardware_interface::HardwareInfo&
   if (get_hardware_parameter("sum_wrapped_joint_states", "false") == "true")
   {
     sum_wrapped_joint_states_ = true;
+  }
+  if (get_hardware_parameter("use_initial_states_as_initial_commands", "false") == "true")
+  {
+    initial_states_as_initial_cmd_ = true;
+    ready_to_send_cmds_ = false;
   }
 
   return CallbackReturn::SUCCESS;
@@ -244,6 +250,18 @@ hardware_interface::return_type TopicBasedSystem::read(const rclcpp::Time& /*tim
     }
   }
 
+  if (!ready_to_send_cmds_ && initial_states_as_initial_cmd_)
+  {
+    for (std::size_t i = 0; i < joint_states_.size(); ++i)
+    {
+      for (std::size_t j = 0; j < joint_states_[i].size(); ++j)
+      {
+        joint_commands_[i][j] = joint_states_[i][j];
+      }
+    }
+    ready_to_send_cmds_ = true;
+  }
+
   return hardware_interface::return_type::OK;
 }
 
@@ -264,17 +282,21 @@ bool TopicBasedSystem::getInterface(const std::string& name, const std::string& 
 
 hardware_interface::return_type TopicBasedSystem::write(const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/)
 {
+  if (!ready_to_send_cmds_)
+  {
+    return hardware_interface::return_type::ERROR;
+  }
   // To avoid spamming TopicBased's joint command topic we check the difference between the joint states and
   // the current joint commands, if it's smaller than a threshold we don't publish it.
   const auto diff = std::transform_reduce(
       joint_states_[POSITION_INTERFACE_INDEX].cbegin(), joint_states_[POSITION_INTERFACE_INDEX].cend(),
       joint_commands_[POSITION_INTERFACE_INDEX].cbegin(), 0.0,
       [](const auto d1, const auto d2) { return std::abs(d1) + std::abs(d2); }, std::minus<double>{});
-  if (diff <= trigger_joint_command_threshold_)
+  if (diff <= trigger_joint_command_threshold_ || diff >= block_joint_command_threshold_)
   {
     return hardware_interface::return_type::OK;
   }
-
+    
   sensor_msgs::msg::JointState joint_state;
   for (std::size_t i = 0; i < info_.joints.size(); ++i)
   {
