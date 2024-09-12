@@ -163,6 +163,17 @@ CallbackReturn TopicBasedSystem::on_init(const hardware_interface::HardwareInfo&
     ready_to_send_cmds_ = false;
   }
 
+  // Check if return of get_hardware_parameter is double type. If not, turn it from string to double type
+  try
+  {
+    block_joint_command_threshold_ = std::stod(get_hardware_parameter("block_joint_command_threshold", "0.5"));
+  }
+  catch (const std::exception& e)
+  {
+    RCLCPP_ERROR(node_->get_logger(), "Failed to convert block_joint_command_threshold to double: %s", e.what());
+    return CallbackReturn::ERROR;
+  }
+
   return CallbackReturn::SUCCESS;
 }
 
@@ -296,7 +307,7 @@ hardware_interface::return_type TopicBasedSystem::write(const rclcpp::Time& /*ti
   {
     return hardware_interface::return_type::OK;
   }
-    
+
   sensor_msgs::msg::JointState joint_state;
   for (std::size_t i = 0; i < info_.joints.size(); ++i)
   {
