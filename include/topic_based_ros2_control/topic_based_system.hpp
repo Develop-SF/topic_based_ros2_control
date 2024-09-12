@@ -97,8 +97,7 @@ private:
   double trigger_joint_command_threshold_ = 1e-5;
   // If the difference between the current joint state and joint command is more than this value,
   // the joint command will not be published.
-  double block_joint_command_threshold_ = 5;
-
+  double block_joint_command_threshold_ = 0.5;
 
   template <typename HandleType>
   bool getInterface(const std::string& name, const std::string& interface_name, const size_t vector_index,
