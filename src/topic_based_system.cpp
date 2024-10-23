@@ -96,6 +96,7 @@ CallbackReturn TopicBasedSystem::on_init(const hardware_interface::HardwareInfo&
       }
     }
   }
+  std::fill(joint_commands_[VELOCITY_INTERFACE_INDEX].begin(), joint_commands_[VELOCITY_INTERFACE_INDEX].end(), 0.0);
   ready_to_send_cmds_ = true;
 
   // Search for mimic joints
@@ -259,7 +260,7 @@ hardware_interface::return_type TopicBasedSystem::read(const rclcpp::Time& /*tim
     {
       joint_state[mimic_joint.joint_index] = mimic_joint.multiplier * joint_state[mimic_joint.mimicked_joint_index];
     }
-  }
+  }  
 
   if (!ready_to_send_cmds_ && initial_states_as_initial_cmd_)
   {
@@ -320,8 +321,16 @@ hardware_interface::return_type TopicBasedSystem::write(const rclcpp::Time& /*ti
       {
         joint_state.position.push_back(joint_commands_[POSITION_INTERFACE_INDEX][i]);
       }
-      else if (interface.name == hardware_interface::HW_IF_VELOCITY)
+      if (interface.name == hardware_interface::HW_IF_VELOCITY)
       {
+        /*std::ostringstream oss;
+        oss << "Vector values: ";
+        
+        for (const auto& value : joint_commands_[VELOCITY_INTERFACE_INDEX]) {
+            oss << value << " ";
+        }
+
+        RCLCPP_INFO(node_->get_logger(), "%s", oss.str().c_str());*/
         joint_state.velocity.push_back(joint_commands_[VELOCITY_INTERFACE_INDEX][i]);
       }
       else if (interface.name == hardware_interface::HW_IF_EFFORT)
