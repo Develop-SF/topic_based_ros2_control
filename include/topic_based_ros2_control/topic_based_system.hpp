@@ -35,6 +35,8 @@
 // C++
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <variant>
 
 // ROS
 #include <hardware_interface/handle.hpp>
@@ -47,9 +49,15 @@
 #include <rclcpp/subscription.hpp>
 
 #include <sensor_msgs/msg/joint_state.hpp>
-
+#include <trajectory_msgs/msg/joint_trajectory.hpp>
 namespace topic_based_ros2_control
 {
+
+enum class TopicBasedCmdType
+{
+  JOINT_STATE,
+  JOINT_TRAJECTORY
+};
 using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
 
 class TopicBasedSystem : public hardware_interface::SystemInterface
@@ -66,8 +74,23 @@ public:
   hardware_interface::return_type write(const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/) override;
 
 private:
+  struct MimicJoint
+  {
+    std::size_t joint_index;
+    std::size_t mimicked_joint_index;
+    double multiplier = 1.0;
+  };
+  std::vector<MimicJoint> mimic_joints_;
+  void updateMimicJoint(const MimicJoint& mimic_joint, sensor_msgs::msg::JointState& joint_state) const;
+  void updateMimicJointTrajectory(const MimicJoint& mimic_joint,
+                                  trajectory_msgs::msg::JointTrajectoryPoint& point) const;
+  void publishJointState();
+  void publishJointTrajectory();
+
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr topic_based_joint_states_subscriber_;
-  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr topic_based_joint_commands_publisher_;
+  using JointCommandPublisher = std::variant<rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr,
+                                             rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr>;
+  JointCommandPublisher topic_based_joint_commands_publisher_;
   rclcpp::Node::SharedPtr node_;
   sensor_msgs::msg::JointState latest_joint_state_;
   bool sum_wrapped_joint_states_{ false };
@@ -80,28 +103,25 @@ private:
                                                       hardware_interface::HW_IF_ACCELERATION,
                                                       hardware_interface::HW_IF_EFFORT };
 
-  struct MimicJoint
-  {
-    std::size_t joint_index;
-    std::size_t mimicked_joint_index;
-    double multiplier = 1.0;
-  };
-  std::vector<MimicJoint> mimic_joints_;
-
   /// The size of this vector is (standard_interfaces_.size() x nr_joints)
   std::vector<std::vector<double>> joint_commands_;
   std::vector<std::vector<double>> joint_states_;
-
+  TopicBasedCmdType joint_commands_type_ = TopicBasedCmdType::JOINT_STATE;
   // If the difference between the current joint state and joint command is less than this value,
   // the joint command will not be published.
   double trigger_joint_command_threshold_ = 1e-5;
   // If the difference between the current joint state and joint command is more than this value,
   // the joint command will not be published.
   double block_joint_command_threshold_ = 0.5;
+  // Only fill the position field in the joint command msg
+  bool position_cmd_only_ = false;
+  // Time from start for the joint trajectory message
+  double time_from_start_ = 0.1;
 
   template <typename HandleType>
   bool getInterface(const std::string& name, const std::string& interface_name, const size_t vector_index,
                     std::vector<std::vector<double>>& values, std::vector<HandleType>& interfaces);
+  TopicBasedCmdType stringToCommandType(const std::string& type_str);
 };
 
 }  // namespace topic_based_ros2_control
