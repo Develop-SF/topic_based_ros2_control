@@ -133,6 +133,22 @@ CallbackReturn TopicBasedSystem::on_init(const hardware_interface::HardwareInfo&
     }
     return default_value;
   };
+  // Load parameters from the hardware interface
+  time_from_start_ = std::stod(get_hardware_parameter("time_from_start", "0.1"));
+  position_cmd_only_ = get_hardware_parameter("position_cmd_only", "false") == "true";
+  std::string joint_commands_type_str = get_hardware_parameter("joint_commands_type", "sensor_msgs/JointState");
+  try
+  {
+    joint_commands_type_ = stringToCommandType(joint_commands_type_str);
+  }
+  catch (const std::exception& e)
+  {
+    RCLCPP_ERROR(node_->get_logger(), "%s", e.what());
+    return CallbackReturn::ERROR;
+  }
+
+  block_joint_command_threshold_ = std::stod(get_hardware_parameter("block_joint_command_threshold", "0.5"));
+  trigger_joint_command_threshold_ = std::stod(get_hardware_parameter("trigger_joint_command_threshold", "1e-5"));
 
   // Add random ID to prevent warnings about multiple publishers within the same node
   rclcpp::NodeOptions options;
@@ -140,13 +156,21 @@ CallbackReturn TopicBasedSystem::on_init(const hardware_interface::HardwareInfo&
 
   node_ = rclcpp::Node::make_shared("_", options);
 
-  if (auto it = info_.hardware_parameters.find("trigger_joint_command_threshold"); it != info_.hardware_parameters.end())
+  switch (joint_commands_type_)
   {
-    trigger_joint_command_threshold_ = std::stod(it->second);
+    case TopicBasedCmdType::JOINT_STATE:
+      topic_based_joint_commands_publisher_ = node_->create_publisher<sensor_msgs::msg::JointState>(
+          get_hardware_parameter("joint_commands_topic", "/robot_joint_commands"), rclcpp::QoS(1));
+      break;
+    case TopicBasedCmdType::JOINT_TRAJECTORY:
+      topic_based_joint_commands_publisher_ = node_->create_publisher<trajectory_msgs::msg::JointTrajectory>(
+          get_hardware_parameter("joint_commands_topic", "/robot_joint_commands"), rclcpp::QoS(1));
+      break;
+    default:
+      RCLCPP_ERROR(node_->get_logger(), "Unsupported joint_commands_type");
+      return CallbackReturn::ERROR;
   }
 
-  topic_based_joint_commands_publisher_ = node_->create_publisher<sensor_msgs::msg::JointState>(
-      get_hardware_parameter("joint_commands_topic", "/robot_joint_commands"), rclcpp::QoS(1));
   topic_based_joint_states_subscriber_ = node_->create_subscription<sensor_msgs::msg::JointState>(
       get_hardware_parameter("joint_states_topic", "/robot_joint_states"), rclcpp::SensorDataQoS(),
       [this](const sensor_msgs::msg::JointState::SharedPtr joint_state) { latest_joint_state_ = *joint_state; });
@@ -162,18 +186,6 @@ CallbackReturn TopicBasedSystem::on_init(const hardware_interface::HardwareInfo&
     initial_states_as_initial_cmd_ = true;
     ready_to_send_cmds_ = false;
   }
-
-  // Check if return of get_hardware_parameter is double type. If not, turn it from string to double type
-  try
-  {
-    block_joint_command_threshold_ = std::stod(get_hardware_parameter("block_joint_command_threshold", "0.5"));
-  }
-  catch (const std::exception& e)
-  {
-    RCLCPP_ERROR(node_->get_logger(), "Failed to convert block_joint_command_threshold to double: %s", e.what());
-    return CallbackReturn::ERROR;
-  }
-
   return CallbackReturn::SUCCESS;
 }
 
@@ -308,62 +320,172 @@ hardware_interface::return_type TopicBasedSystem::write(const rclcpp::Time& /*ti
     return hardware_interface::return_type::OK;
   }
 
+  switch (joint_commands_type_)
+  {
+    case TopicBasedCmdType::JOINT_STATE:
+      publishJointState();
+      break;
+    case TopicBasedCmdType::JOINT_TRAJECTORY:
+      publishJointTrajectory();
+      break;
+    default:
+      RCLCPP_ERROR(node_->get_logger(), "Unsupported joint_commands_type");
+      return hardware_interface::return_type::ERROR;
+  }
+
+  return hardware_interface::return_type::OK;
+}
+
+void TopicBasedSystem::publishJointState()
+{
   sensor_msgs::msg::JointState joint_state;
+  joint_state.header.stamp = node_->now();
+
+  // Pre-allocate vectors to avoid reallocations
+  joint_state.name.reserve(info_.joints.size());
+  joint_state.position.reserve(info_.joints.size());
+  joint_state.velocity.reserve(info_.joints.size());
+  joint_state.effort.reserve(info_.joints.size());
+
+  // Fill joint state message
   for (std::size_t i = 0; i < info_.joints.size(); ++i)
   {
     joint_state.name.push_back(info_.joints[i].name);
-    joint_state.header.stamp = node_->now();
-    // only send commands to the interfaces that are defined for this joint
+
     for (const auto& interface : info_.joints[i].command_interfaces)
     {
       if (interface.name == hardware_interface::HW_IF_POSITION)
       {
         joint_state.position.push_back(joint_commands_[POSITION_INTERFACE_INDEX][i]);
       }
-      else if (interface.name == hardware_interface::HW_IF_VELOCITY)
+      if (!position_cmd_only_)
       {
-        joint_state.velocity.push_back(joint_commands_[VELOCITY_INTERFACE_INDEX][i]);
-      }
-      else if (interface.name == hardware_interface::HW_IF_EFFORT)
-      {
-        joint_state.effort.push_back(joint_commands_[EFFORT_INTERFACE_INDEX][i]);
-      }
-      else
-      {
-        RCLCPP_WARN_ONCE(node_->get_logger(), "Joint '%s' has unsupported command interfaces found: %s.",
-                         info_.joints[i].name.c_str(), interface.name.c_str());
+        if (interface.name == hardware_interface::HW_IF_VELOCITY)
+        {
+          joint_state.velocity.push_back(joint_commands_[VELOCITY_INTERFACE_INDEX][i]);
+        }
+        else if (interface.name == hardware_interface::HW_IF_EFFORT)
+        {
+          joint_state.effort.push_back(joint_commands_[EFFORT_INTERFACE_INDEX][i]);
+        }
       }
     }
   }
 
+  // Handle mimic joints
   for (const auto& mimic_joint : mimic_joints_)
   {
-    for (const auto& interface : info_.joints[mimic_joint.mimicked_joint_index].command_interfaces)
+    updateMimicJoint(mimic_joint, joint_state);
+  }
+
+  std::get<rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr>(topic_based_joint_commands_publisher_)
+      ->publish(joint_state);
+}
+
+void TopicBasedSystem::publishJointTrajectory()
+{
+  trajectory_msgs::msg::JointTrajectory joint_trajectory;
+  joint_trajectory.points.resize(1);
+  joint_trajectory.joint_names.reserve(info_.joints.size());
+
+  auto& point = joint_trajectory.points[0];
+  point.positions.reserve(info_.joints.size());
+  point.velocities.reserve(info_.joints.size());
+  point.effort.reserve(info_.joints.size());
+  point.time_from_start = rclcpp::Duration::from_seconds(time_from_start_);
+
+  // Fill trajectory message
+  for (std::size_t i = 0; i < info_.joints.size(); ++i)
+  {
+    joint_trajectory.joint_names.push_back(info_.joints[i].name);
+
+    for (const auto& interface : info_.joints[i].command_interfaces)
     {
       if (interface.name == hardware_interface::HW_IF_POSITION)
       {
-        joint_state.position[mimic_joint.joint_index] =
-            mimic_joint.multiplier * joint_state.position[mimic_joint.mimicked_joint_index];
+        point.positions.push_back(joint_commands_[POSITION_INTERFACE_INDEX][i]);
       }
-      else if (interface.name == hardware_interface::HW_IF_VELOCITY)
+      if (!position_cmd_only_)
       {
-        joint_state.velocity[mimic_joint.joint_index] =
-            mimic_joint.multiplier * joint_state.velocity[mimic_joint.mimicked_joint_index];
-      }
-      else if (interface.name == hardware_interface::HW_IF_EFFORT)
-      {
-        joint_state.effort[mimic_joint.joint_index] =
-            mimic_joint.multiplier * joint_state.effort[mimic_joint.mimicked_joint_index];
+        if (interface.name == hardware_interface::HW_IF_VELOCITY)
+        {
+          point.velocities.push_back(joint_commands_[VELOCITY_INTERFACE_INDEX][i]);
+        }
+        else if (interface.name == hardware_interface::HW_IF_EFFORT)
+        {
+          point.effort.push_back(joint_commands_[EFFORT_INTERFACE_INDEX][i]);
+        }
       }
     }
   }
 
-  if (rclcpp::ok())
+  // Handle mimic joints for trajectory
+  for (const auto& mimic_joint : mimic_joints_)
   {
-    topic_based_joint_commands_publisher_->publish(joint_state);
+    updateMimicJointTrajectory(mimic_joint, point);
   }
 
-  return hardware_interface::return_type::OK;
+  std::get<rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr>(topic_based_joint_commands_publisher_)
+      ->publish(joint_trajectory);
+}
+
+void TopicBasedSystem::updateMimicJoint(const MimicJoint& mimic_joint, sensor_msgs::msg::JointState& joint_state) const
+{
+  if (!joint_state.position.empty())
+  {
+    joint_state.position[mimic_joint.joint_index] =
+        mimic_joint.multiplier * joint_state.position[mimic_joint.mimicked_joint_index];
+  }
+  if (!position_cmd_only_)
+  {
+    if (!joint_state.velocity.empty())
+    {
+      joint_state.velocity[mimic_joint.joint_index] =
+          mimic_joint.multiplier * joint_state.velocity[mimic_joint.mimicked_joint_index];
+    }
+    if (!joint_state.effort.empty())
+    {
+      joint_state.effort[mimic_joint.joint_index] =
+          mimic_joint.multiplier * joint_state.effort[mimic_joint.mimicked_joint_index];
+    }
+  }
+}
+
+void TopicBasedSystem::updateMimicJointTrajectory(const MimicJoint& mimic_joint,
+                                                  trajectory_msgs::msg::JointTrajectoryPoint& point) const
+{
+  if (!point.positions.empty())
+  {
+    point.positions[mimic_joint.joint_index] =
+        mimic_joint.multiplier * point.positions[mimic_joint.mimicked_joint_index];
+  }
+  if (!position_cmd_only_)
+  {
+    if (!point.velocities.empty())
+    {
+      point.velocities[mimic_joint.joint_index] =
+          mimic_joint.multiplier * point.velocities[mimic_joint.mimicked_joint_index];
+    }
+    if (!point.effort.empty())
+    {
+      point.effort[mimic_joint.joint_index] = mimic_joint.multiplier * point.effort[mimic_joint.mimicked_joint_index];
+    }
+  }
+}
+
+TopicBasedCmdType TopicBasedSystem::stringToCommandType(const std::string& type_str)
+{
+  static const std::unordered_map<std::string, TopicBasedCmdType> type_map = {
+    { "sensor_msgs/JointState", TopicBasedCmdType::JOINT_STATE },
+    { "trajectory_msgs/JointTrajectory", TopicBasedCmdType::JOINT_TRAJECTORY }
+  };
+
+  auto it = type_map.find(type_str);
+  if (it == type_map.end())
+  {
+    throw std::runtime_error("Unsupported joint_commands_type: " + type_str);
+  }
+  return it->second;
 }
 }  // end namespace topic_based_ros2_control
 
