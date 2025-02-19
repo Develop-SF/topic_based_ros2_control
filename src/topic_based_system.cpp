@@ -387,7 +387,7 @@ void TopicBasedSystem::publishJointTrajectory()
   trajectory_msgs::msg::JointTrajectory joint_trajectory;
   joint_trajectory.points.resize(1);
   joint_trajectory.joint_names.reserve(info_.joints.size());
-
+  joint_trajectory.header.stamp = rclcpp::Clock().now();
   auto& point = joint_trajectory.points[0];
   point.positions.reserve(info_.joints.size());
   point.velocities.reserve(info_.joints.size());
